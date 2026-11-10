@@ -20,30 +20,6 @@ type StatusError struct {
 	status int
 }
 
-// Pre function executes commands on pre section before build
-func Pre(app App) error {
-	for _, value := range app.Pre {
-		info("Running pre command: %s", value)
-		res := execute("bash", "-c", value)
-		if res != nil {
-			return res
-		}
-	}
-	return nil
-}
-
-// Post function executes commands on pre section after build
-func Post(app App) error {
-	for _, value := range app.Post {
-		info("Running post command: %s", value)
-		res := execute("bash", "-c", value)
-		if res != nil {
-			return res
-		}
-	}
-	return nil
-}
-
 type BuildOptions struct {
 	Config       Config
 	Tag          string
@@ -52,36 +28,148 @@ type BuildOptions struct {
 	Long_sha     bool
 	Branch_tags  bool
 	Commit_tags  bool
+
+	// Lifecycle is the shared cancellation scope for build/test/push.
+	// When nil, a never-cancelled background lifecycle is used so that
+	// standalone callers keep their historical behavior.
+	Lifecycle *Lifecycle
+}
+
+// lifecycle returns the shared cancellation scope, falling back to the
+// inert background lifecycle for callers that did not provide one.
+func (opts BuildOptions) lifecycle() *Lifecycle {
+	if opts.Lifecycle != nil {
+		return opts.Lifecycle
+	}
+	return backgroundLifecycle
+}
+
+// Pre function executes commands on pre section before build
+func Pre(app App) error {
+	return runPre(backgroundLifecycle, app)
+}
+
+func runPre(lc *Lifecycle, app App) error {
+	for _, value := range app.Pre {
+		if err := lc.Checkpoint(); err != nil {
+			return err
+		}
+		info("Running pre command: %s", value)
+		if err := lc.Finish(executeCtx(lc.Context(), "bash", "-c", value)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Post function executes commands on pre section after build
+func Post(app App) error {
+	return runPost(backgroundLifecycle, app)
+}
+
+func runPost(lc *Lifecycle, app App) error {
+	for _, value := range app.Post {
+		if err := lc.Checkpoint(); err != nil {
+			return err
+		}
+		info("Running post command: %s", value)
+		if err := lc.Finish(executeCtx(lc.Context(), "bash", "-c", value)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tagSwallow applies a tag while honouring the lifecycle. Historically
+// these particular tag calls ignored ordinary tag errors, so only a
+// cancelled run is allowed to interrupt the flow.
+func tagSwallow(lc *Lifecycle, app App, origin, tag string) error {
+	if err := lc.Checkpoint(); err != nil {
+		return err
+	}
+	_ = tagImageCtx(lc.Context(), app, origin, tag)
+	return lc.Finish(nil)
+}
+
+// tagStrict applies a branch tag where failures historically aborted the
+// run with TagFailed. Cancellation still takes precedence over the exit.
+func tagStrict(lc *Lifecycle, app App, origin, tag string) error {
+	if err := lc.Checkpoint(); err != nil {
+		return err
+	}
+	if err := tagImageCtx(lc.Context(), app, origin, tag); err != nil {
+		if lc.Cancelled() {
+			return ErrCancelled
+		}
+		os.Exit(TagFailed)
+	}
+	return lc.Finish(nil)
 }
 
 // Build function compiles the Containers of the project
 func Build(opts BuildOptions) {
+	if runErr := runBuild(opts); runErr != nil {
+		if runErr == ErrCancelled {
+			err("Build cancelled")
+			os.Exit(Cancelled)
+		}
+		err("Build failed: %s", runErr)
+		os.Exit(BuildFailed)
+	}
+}
+
+// runBuild contains the build logic and returns ErrCancelled at any
+// stage boundary or step completion once the lifecycle is terminated,
+// which makes it testable without killing the test process.
+func runBuild(opts BuildOptions) error {
 	config := opts.Config
+	lc := opts.lifecycle()
 
 	var rev = getRevision(opts.Long_sha)
 
 	// For each App
 	for _, app := range config.GetApps() {
+		// Stage switch guard: never start another app after termination.
+		if err := lc.Checkpoint(); err != nil {
+			return err
+		}
+
 		// If no Git repo exist
 		if !isGit() {
 			// Perfoming [build latest]
 			debug("No local git repository found, just building latest")
 
 			// Execute Pre commands
-			if res := Pre(app); res != nil {
+			if res := lc.Finish(runPre(lc, app)); res != nil {
+				if res == ErrCancelled {
+					return res
+				}
 				err("Pre execution returned non-zero status")
-				return
+				return res
 			}
 
 			// Build latest image
-			res := buildImage(app, "latest", opts.Force)
+			if err := lc.Checkpoint(); err != nil {
+				return err
+			}
+			res := lc.Finish(buildImageCtx(lc.Context(), app, "latest", opts.Force))
 			if res != nil {
+				if res == ErrCancelled {
+					return res
+				}
 				os.Exit(BuildFailed)
+			}
+
+			// No tagging is allowed once cancelled.
+			if err := lc.Checkpoint(); err != nil {
+				return err
 			}
 
 			// Add additional user-defined Tag
 			if opts.Tag != "" {
-				tagImage(app, "latest", opts.Tag)
+				if err := tagSwallow(lc, app, "latest", opts.Tag); err != nil {
+					return err
+				}
 			}
 		} else {
 			// Skip build if there are no local changes and the commit is already built
@@ -90,81 +178,144 @@ func Build(opts BuildOptions) {
 				info("Skipping build of %s:%s - image is already built", app.Image, rev)
 
 				// Tag commit image
-				tagImage(app, rev, "latest")
+				if err := tagSwallow(lc, app, rev, "latest"); err != nil {
+					return err
+				}
 
 				// Tag branch image
 				for _, branch := range getBranches(opts.All_branches) {
-					res := tagImage(app, rev, branch)
-					if res != nil {
-						os.Exit(TagFailed)
+					if err := tagStrict(lc, app, rev, branch); err != nil {
+						return err
 					}
 				}
 
 				// Add additional user-defined Tag
 				if opts.Tag != "" {
-					tagImage(app, rev, opts.Tag)
+					if err := tagSwallow(lc, app, rev, opts.Tag); err != nil {
+						return err
+					}
 				}
 			} else {
 				// Performing [build latest|tag latest@rev|tag latest@branch]
 
 				// Execute Pre commands
-				if res := Pre(app); res != nil {
+				if res := lc.Finish(runPre(lc, app)); res != nil {
+					if res == ErrCancelled {
+						return res
+					}
 					err("Pre execution returned non-zero status")
 				}
 
 				// Build latest image
-				res := buildImage(app, "latest", opts.Force)
+				if err := lc.Checkpoint(); err != nil {
+					return err
+				}
+				res := lc.Finish(buildImageCtx(lc.Context(), app, "latest", opts.Force))
 				if res != nil {
+					if res == ErrCancelled {
+						return res
+					}
 					os.Exit(BuildFailed)
 				}
 				if isDirty() {
 					debug("Skipping tag of %s:%s - local changes exist", app.Image, rev)
 				} else {
+					// No tagging is allowed once cancelled.
+					if err := lc.Checkpoint(); err != nil {
+						return err
+					}
+
 					// Tag commit image
-					tagImage(app, "latest", rev)
+					if err := tagSwallow(lc, app, "latest", rev); err != nil {
+						return err
+					}
 
 					// Tag branch image
 					for _, branch := range getBranches(opts.All_branches) {
-						res := tagImage(app, "latest", branch)
-						if res != nil {
-							os.Exit(TagFailed)
+						if err := tagStrict(lc, app, "latest", branch); err != nil {
+							return err
 						}
 					}
 
 					// Add additional user-defined Tag
 					if opts.Tag != "" {
-						tagImage(app, rev, opts.Tag)
+						if err := tagSwallow(lc, app, rev, opts.Tag); err != nil {
+							return err
+						}
 					}
 				}
 			}
 		}
 
-		// Execute Post commands
-		if res := Post(app); res != nil {
+		// Execute Post commands only while the run is still alive:
+		// cancellation must never trigger ordinary post commands.
+		if err := lc.Checkpoint(); err != nil {
+			return err
+		}
+		if res := lc.Finish(runPost(lc, app)); res != nil {
+			if res == ErrCancelled {
+				return res
+			}
 			err("Post execution returned non-zero status")
 		}
 	}
+	return nil
 }
 
 // Test function executes the tests of the project
 func Test(opts BuildOptions) {
+	if runErr := runTest(opts); runErr != nil {
+		if runErr == ErrCancelled {
+			err("Test cancelled")
+			os.Exit(Cancelled)
+		}
+		err("Test execution returned non-zero status")
+		os.Exit(ExecuteFailed)
+	}
+}
+
+func runTest(opts BuildOptions) error {
 	config := opts.Config
+	lc := opts.lifecycle()
 
 	for _, app := range config.GetApps() {
+		// Stage switch guard.
+		if err := lc.Checkpoint(); err != nil {
+			return err
+		}
 		for _, value := range app.Test {
+			if err := lc.Checkpoint(); err != nil {
+				return err
+			}
 			info("Running test command: %s", value)
-			res := execute("bash", "-c", value)
+			res := lc.Finish(executeCtx(lc.Context(), "bash", "-c", value))
 			if res != nil {
+				if res == ErrCancelled {
+					return res
+				}
 				err("Test execution returned non-zero status")
 				os.Exit(ExecuteFailed)
 			}
 		}
 	}
+	return nil
 }
 
 // Push function pushes the containers to the remote registry
 func Push(opts BuildOptions) {
+	if runErr := runPush(opts); runErr != nil {
+		if runErr == ErrCancelled {
+			err("Push cancelled")
+			os.Exit(Cancelled)
+		}
+		err("Push returned non-zero status")
+		os.Exit(ExecuteFailed)
+	}
+}
+
+func runPush(opts BuildOptions) error {
 	config := opts.Config
+	lc := opts.lifecycle()
 
 	// If no Git repo exist
 	if !isGit() {
@@ -178,38 +329,59 @@ func Push(opts BuildOptions) {
 	}
 
 	for _, app := range config.GetApps() {
+		// Stage switch guard: no app is pushed after termination.
+		if err := lc.Checkpoint(); err != nil {
+			return err
+		}
 		for _, branch := range getBranches(opts.All_branches) {
+			if err := lc.Checkpoint(); err != nil {
+				return err
+			}
 			info("Pushing image %s:%s", app.Image, "latest")
-			if res := pushImage(app.Image, "latest"); res != nil {
-				err("Push returned non-zero status")
-				os.Exit(ExecuteFailed)
+			if err := pushOne(lc, app.Image, "latest"); err != nil {
+				return err
 			}
 			if opts.Branch_tags {
 				info("Pushing image %s:%s", app.Image, branch)
-				if res := pushImage(app.Image, branch); res != nil {
-					err("Push returned non-zero status")
-					os.Exit(ExecuteFailed)
+				if err := pushOne(lc, app.Image, branch); err != nil {
+					return err
 				}
 			}
 			if opts.Commit_tags {
 				rev := getRevision(opts.Long_sha)
 				info("Pushing image %s:%s", app.Image, rev)
-				if res := pushImage(app.Image, rev); res != nil {
-					err("Push returned non-zero status")
-					os.Exit(ExecuteFailed)
+				if err := pushOne(lc, app.Image, rev); err != nil {
+					return err
 				}
 			}
 
 			// Add additional user-defined Tag
 			if opts.Tag != "" {
 				info("Pushing image %s:%s", app.Image, opts.Tag)
-				if res := pushImage(app.Image, opts.Tag); res != nil {
-					err("Push returned non-zero status")
-					os.Exit(ExecuteFailed)
+				if err := pushOne(lc, app.Image, opts.Tag); err != nil {
+					return err
 				}
 			}
 		}
 	}
+	return nil
+}
+
+// pushOne performs a single push while honouring the lifecycle. Ordinary
+// push failures keep their historical ExecuteFailed exit.
+func pushOne(lc *Lifecycle, image, version string) error {
+	if err := lc.Checkpoint(); err != nil {
+		return err
+	}
+	res := lc.Finish(pushImageCtx(lc.Context(), image, version))
+	if res != nil {
+		if res == ErrCancelled {
+			return res
+		}
+		err("Push returned non-zero status")
+		os.Exit(ExecuteFailed)
+	}
+	return nil
 }
 
 // Pull function pulls the containers from the remote registry

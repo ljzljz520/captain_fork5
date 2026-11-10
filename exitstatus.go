@@ -33,4 +33,7 @@ const (
 
 	// ExecuteFailed represents an execution failure
 	ExecuteFailed = 12
+
+	// Cancelled represents a run terminated by signal or timeout
+	Cancelled = 13
 )

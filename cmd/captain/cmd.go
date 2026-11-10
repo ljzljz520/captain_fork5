@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/harbur/captain"
@@ -18,6 +20,7 @@ type Options struct {
 	config    string
 	images    []string
 	tag       string
+	timeout   time.Duration
 
 	// Options to define the docker tags context
 	all_branches bool
@@ -26,6 +29,24 @@ type Options struct {
 }
 
 var options Options
+
+// defaultTimeout lets CI express the deadline via CAPTAIN_TIMEOUT (a
+// Go duration, e.g. "30m") when no --timeout flag is provided.
+func defaultTimeout() time.Duration {
+	if raw := os.Getenv("CAPTAIN_TIMEOUT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			return d
+		}
+	}
+	return 0
+}
+
+// newLifecycle builds the single cancellation scope shared by every
+// stage of a command invocation (e.g. build + test, or build + push) and
+// starts forwarding termination signals to it.
+func newLifecycle() *captain.Lifecycle {
+	return captain.NewLifecycle(context.Background(), options.timeout).CatchSignals()
+}
 
 func handleCmd() {
 
@@ -48,6 +69,7 @@ func handleCmd() {
 				Long_sha:     options.long_sha,
 				Branch_tags:  options.branch_tags,
 				Commit_tags:  options.commit_tags,
+				Lifecycle:    newLifecycle(),
 			}
 
 			captain.Build(buildOpts)
@@ -73,6 +95,9 @@ func handleCmd() {
 				Long_sha:     options.long_sha,
 				Branch_tags:  options.branch_tags,
 				Commit_tags:  options.commit_tags,
+				// One lifecycle spans build and test so a signal during
+				// either stage cancels the whole command.
+				Lifecycle: newLifecycle(),
 			}
 
 			// Build everything before testing
@@ -100,6 +125,9 @@ func handleCmd() {
 				Long_sha:     options.long_sha,
 				Branch_tags:  options.branch_tags,
 				Commit_tags:  options.commit_tags,
+				// One lifecycle spans build and push so tagging and
+				// pushing cannot proceed after cancellation.
+				Lifecycle: newLifecycle(),
 			}
 
 			// Build everything before pushing
@@ -186,6 +214,7 @@ It works by reading captain.yaml file which describes how to build, test, push a
 	captainCmd.PersistentFlags().StringVarP(&options.namespace, "namespace", "N", getNamespace(), "Set default image namespace")
 	captainCmd.PersistentFlags().BoolVarP(&color.NoColor, "no-color", "n", false, "Disable color output")
 	captainCmd.PersistentFlags().BoolVarP(&options.long_sha, "long-sha", "l", false, "Use the long git commit SHA when referencing revisions")
+	captainCmd.PersistentFlags().DurationVar(&options.timeout, "timeout", defaultTimeout(), "Cancel the whole run after this duration (e.g. 30m); 0 disables it. Can also be set via CAPTAIN_TIMEOUT")
 
 	cmdBuild.Flags().BoolVarP(&options.force, "force", "f", false, "Force build even if image is already built")
 	cmdBuild.Flags().BoolVarP(&options.all_branches, "all-branches", "B", false, "Build all branches on specific commit instead of just working branch")
